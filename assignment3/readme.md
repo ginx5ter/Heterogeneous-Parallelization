@@ -3,8 +3,9 @@
 
 ---
 
-```markdown
+
 ## Среда выполнения
+```markdown
 
 - GPU: NVIDIA GeForce RTX 3070 Ti (compute capability 8.6, 8 ГБ)  
 - ОС: Windows 11  
