@@ -24,3 +24,13 @@ assignment3
 ├── t3.cu (Задача 3)
 ├── t4.cu (Задача 4)
 ```
+
+---
+
+## Результаты компиляции
+### Задача 1
+```markdown
+C:\Users\jinx\Desktop\assignment3>t1.exe
+Global memory version : 0.092 ms
+Shared memory version : 0.013 ms
+```
