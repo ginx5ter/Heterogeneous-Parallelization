@@ -1,0 +1,1847 @@
+// BOSH Discentis driver
+// Revised: 06.01.2017
+// Author: Petr Fabián
+//-------------------------------------------------------------------------------------------
+//
+//	1.00
+//	1.01 x EncodeDigest
+//	1.03 + SetIdentificationMode, fix SetVoting
+//	1.04 x Wim modification
+//
+//-------------------------------------------------------------------------------------------
+
+//-------------------------------------------------------------------------------------------
+// Constant
+//-------------------------------------------------------------------------------------------
+
+Global Const cMaxJsonLength As Long := 71500
+Global Const cCommandJsonLength As Long := 71500
+Global Const cSeatsJsonLength As Long := 71500
+Global Const cSpeakersJsonLength As Long := 3600
+Global Const cWaitingListJsonLength As Long := 16000
+Global Const cVotingJsonLength As Long := 17500
+
+Private Const cGET As ByteString := &S"GET"
+Private Const cPOST As ByteString := &S"POST"
+Private Const cPUT As ByteString := &S"PUT"
+Private Const cDELETE As ByteString := &S"DELETE"
+Private Const cDataJSON As ByteString := &S"application/json;charset=utf-8"
+
+
+//-------------------------------------------------------------------------------------------
+// Typedef
+//-------------------------------------------------------------------------------------------
+
+Private Structure sLogin	// JSON length 156
+	Var id As Long
+	Var sid As Text[140]
+End Structure
+
+Global Structure sSeat	// JSON length 710
+	Var batteryStatus As  Long    
+	Var batteryCharges As  Long    
+	Var name As Text[32]
+	Var prio As  Boolean    
+	Var extra_seat As  Boolean    
+	Var signalStatus As  Long    
+	Var selected As  Boolean    
+	Var cameraPrepos As  Long    
+	Var batterySerialNo As  Text[32]    
+	Var cameraId As  Long    
+	Var unitType As  Long    
+	Var connected As  Boolean    
+	Var signalLevel As  Long    
+	Var dual As  Boolean    
+	Var unitId As  Long
+	Var hasDisplay As Boolean    
+	Var identification As  Boolean    
+	Var voting As  Boolean    
+	Var id As  Long    
+	Var rangeTest As  Long    
+	Var unitProps As  Long    
+End Structure
+
+Global Structure sSpeaker	// JSON length 160
+	Var id As Long
+	Var name As Text[32]
+	Var micOn As Boolean
+	Var participantId As Long
+	Var prio As Boolean
+	Var seatName As Text[32]
+End Structure
+
+Global Structure sVotingParameters	// JSON length 115
+	Var individuals As Boolean
+	Var mode As Long
+	Var subject As Text[64]
+End Structure
+
+Private Structure sVotingState	// JSON length 20
+	Var state As Long
+End Structure
+
+Structure sVotingIndividualResults	// JSON length 170
+	Var id As Long
+	Var name As Text[32]
+	Var participantId As Long
+	Var result As Text[32]
+	Var seatName As Text[32]
+End Structure
+
+Structure sVotingResult	// JSON length 60
+	Var name As Text[32]
+	Var val Alias "value" As Long
+End Structure
+
+Global Structure sVotingResults // JSON length 470 (17470)
+	Var individuals[100] As sVotingIndividualResults
+	Var mode As Long
+	Var results[7] As sVotingResult
+	Var state As Long
+	Var subject As Text[64]
+End Structure
+
+Private Structure sError	// JSON length 164
+	Var code As Long
+	Var description As Text[64]
+	Var details As Text[64]
+End Structure
+
+Private Structure sSystemStatus	// JSON length 18
+	Var state As Long
+End Structure
+
+Private Structure sBattery	// JSON length 24
+	Var batteryWarning As Boolean
+End Structure
+
+//-------------------------------------------------------------------------------------------
+
+Private Class HttpProtocol
+Friend Dicentis
+
+//-------------------------------------------------------------------------------------------
+
+Var pOwner As AddressOf Dicentis
+Var iChnl As Byte
+Var pAnswer As AddressOf ByteString
+
+Private Var lckHTTP As _Semaphore
+Private Var bsRequest As ByteString[1024]
+Private Var bsTemp1 As ByteString [1024]
+Private Var bsTemp2 As ByteString [1024]
+
+//-------------------------------------------------------------------------------------------
+
+Private Function Init( )
+	iChnl := 0
+	pOwner := Nothing
+	pAnswer := Nothing
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Private Function Initialize( Chnl As Byte, Owner As AddressOf Dicentis, Answer As AddressOf ByteString)
+	iChnl := Chnl
+	pOwner := Owner
+	pAnswer := Answer
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Private Function OpenCommunication()
+
+	Var iCount As Byte
+
+	For iCount := 1 To 5
+		If pOwner.fSSL Then
+			If Not pOwner.ConnectSSL( iChnl, pOwner.strAddress, pOwner.lPort, :2.0) Then
+				If pOwner.bDebug > 1 Then
+					DebugPrintFormat( "<DICENTIS> HTTPconnectSSL({N}): error {N}", iCount, GetLastError())
+				End If
+				Wait(:0.5)	// Wait 0.5 sec and try to connect again
+			Else
+				Exit For	// Connection success
+			End If
+		Else
+			If Not pOwner.Connect( iChnl, pOwner.strAddress, pOwner.lPort, :2.0) Then
+				If pOwner.bDebug > 1 Then
+					DebugPrintFormat( "<DICENTIS> HTTPconnect({N}): error {N}", iCount, GetLastError())
+				End If
+				Wait(:0.5)	// Wait 0.5 sec and try to connect again
+			Else
+				Exit For	// Connection success
+			End If
+		End If
+	End For
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Private Function CloseCommunication()
+
+	pOwner.Disconnect( iChnl)
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Private Function Cmd( ByVal bsMethod As ByteString,
+					 ByVal bsURL As ByteString,
+					 ByVal bsContentsType As ByteString,
+					 ByVal bsData As ByteString,
+					 Optional tTimeOut As Time := :10.0
+					) As Boolean // True is OK
+
+	Var fLogin As Boolean := False
+	Var lCode As Long := -1
+
+	Do
+		If Not HttpPacket( bsMethod, bsURL, bsContentsType, bsData, tTimeOut) Then
+			lCode := GetLastError()
+			If lCode = 401 And Not fLogin Then
+					fLogin := True
+					pOwner.lckSid.Lock()
+					_ClearVariable( pOwner.bsSid)
+					If Not HttpPacket( cPOST, &S"/api/login", cDataJSON, pOwner.bsLoginJSON) Then
+						If pOwner.bDebug > 1 Then
+							DebugPrintFormat( "<DICENTIS> login ERROR({N}): {S}", GetLastError(), pAnswer)
+						End If
+						pOwner.lckSid.Unlock()
+						Exit Do
+					End If
+					HttpResponseCutHeader()
+					pOwner.lckTmp.Lock()
+					ByteStringToText( pAnswer, pOwner.txtTmp, _UTF8_TO_TEXT)
+					_ClearVariable( pOwner.dLogin)
+					ParseJSON( pOwner.txtTmp, pOwner.dLogin)
+					pOwner.lckTmp.Unlock()
+					TextToByteString( pOwner.dLogin.sid, pOwner.bsSid, _TEXT_TO_UTF8)
+					ConcatenateByteString( pOwner.bsSid, &S"Cookie: sid=", pOwner.bsSid)
+					pOwner.lckSid.Unlock()
+					If pOwner.bDebug > 0 Then
+						DebugPrintFormat( "<DICENTIS> *** login: {S}", pOwner.bsSid)
+					End If
+			Else
+				Exit Do
+			End If
+		Else
+			lCode := GetLastError()
+			If pOwner.bDebug = 2 Then
+				DebugPrintFormat( "<DICENTIS> {S} {S}({N}): {S}", bsMethod, bsURL, GetLastError(), pAnswer)
+			End If
+			SetLastError( lCode)
+			Return Value True
+		End If
+	End Do
+
+	SetLastError( lCode)
+	Return Value False
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Private Function HttpPacket( ByVal bsMethod As ByteString,
+							 ByVal bsURL As ByteString,
+							 ByVal bsContentsType As ByteString,
+							 ByVal bsData As ByteString,
+							 Optional tTimeOut As Time := :10.0
+							) As Boolean // True is OK, bsURL is filename on WEB server
+
+	Var lCode As Long := -1
+	Var i As Long
+//	Var chr As ByteString := &S" "
+
+	If pAnswer = Nothing Or GetByteStringDeclaredLength( pAnswer) < 512 Then
+		Return Value False
+	End If
+
+	lckHTTP.Lock()
+
+	For i := 1 To 2
+		If GetByteStringActualLength( bsURL) = 0 Or ((bsURL[1] <> &H2F) And (bsURL[1] <> &H5C)) Then
+			ConcatenateByteString( bsRequest, bsMethod, &S" /", bsURL)
+		Else
+			ConcatenateByteString( bsRequest, bsMethod, &S" ", bsURL)
+		End If
+
+		ConcatenateByteString( bsRequest, bsRequest, &S" HTTP/1.0\0D\0AHost: ", pOwner.bsAddress)
+
+		If i <> 1 Then
+			If GetByteStringActualLength( pOwner.bsUser) = 0 Then
+				Exit For
+			ElseIf GetSubByteStringPosition( pAnswer, &S"WWW-Authenticate: Digest", 1, False) <> 0 Then
+				If Not EncodeDigest( bsRequest, pOwner.bsUser, pOwner.bsPassword, pAnswer) Then
+					If pOwner.bDebug > 0 Then
+						DebugPrint( "<DICENTIS> EncodeDigest failed ??")
+					End If
+					Exit For
+				End If
+			ElseIf GetSubByteStringPosition( pAnswer, &S"WWW-Authenticate: Basic", 1, False) <> 0 Then
+				If Not ConcatenateByteString( bsTemp1, pOwner.bsUser, &S":", pOwner.bsPassword)
+				 Or Not EncodeBase64( bsTemp1, bsTemp2)
+				 Or Not ConcatenateByteString( bsRequest, bsRequest, &S"\0D\0AAuthorization: Basic ", bsTemp2) Then
+					Exit For
+				End If
+			Else
+				Exit For
+			End If
+		End If
+	
+		If GetByteStringActualLength( bsContentsType) <> 0 Then
+			ConcatenateByteString( bsRequest, bsRequest, &S"\0D\0AContent-Type: ", bsContentsType)
+			If GetSubByteStringPosition( bsContentsType, &S"charset", 1, False) = 0 Then
+				ConcatenateByteString( bsRequest, bsRequest, &S";charset=UTF-8")
+			End If
+		End If
+
+		If GetByteStringActualLength( pOwner.bsSid) <> 0 Then
+			SetByteStringActualLength( pAnswer, 0)
+			TrimByteString( pOwner.bsSid, pAnswer, &S"\0D\0A")
+			ConcatenateByteString( bsRequest, bsRequest, &S"\0D\0A", pAnswer)
+		End If
+
+		If GetByteStringActualLength( bsData) <> 0 Then
+			FormatByteString( bsTemp2, &S"{N}", GetByteStringActualLength( bsData))
+			ConcatenateByteString( bsRequest, bsRequest, &S"\0D\0AContent-Length: ", bsTemp2,
+							 	&S"\0D\0AAccept:*/*\0D\0AAccept-charset:UTF-8\0D\0A\0D\0A", bsData)
+		Else
+			ConcatenateByteString( bsRequest, bsRequest, &S"\0D\0AAccept:*/*\0D\0AAccept-charset:UTF-8\0D\0A\0D\0A")
+		End If
+
+		If pOwner.bDebug > 2 Then
+			DebugPrintFormat( "<DICENTIS> Http{S} request: {S}", bsMethod, bsRequest)
+		End If
+
+		SetByteStringActualLength( pAnswer, 0)
+
+		OpenCommunication()
+		If Not pOwner.Send( iChnl, bsRequest) Then		// try twice
+			CloseCommunication()
+			OpenCommunication()
+			If Not pOwner.Send( iChnl, bsRequest) Then
+				If pOwner.bDebug > 2 Then
+					DebugPrintFormat( "<DICENTIS> Http{S} Send failed: {N}", bsMethod, GetLastError())
+				End If
+				CloseCommunication()
+				Exit For
+			End If
+		End If
+
+		If Not pOwner.Receive( iChnl, pAnswer, tTimeOut) Then
+			lCode := GetLastError()
+		End If
+
+		If pOwner.bDebug > 2 Then
+			DebugPrintFormat( "<DICENTIS> Http{S} receive: {S}", bsMethod, pAnswer)
+		End If
+
+		CloseCommunication()
+
+		If GetByteStringActualLength( pAnswer) > 8 Then					// HTTP/1.0 200 OK<cr><lf>
+			GetByteStringLeft( pAnswer, 5, bsRequest)
+			If CompareByteString( bsRequest, &S"HTTP/") = _COMPARE_EQUAL Then
+				GetByteStringRight( pAnswer, GetByteStringActualLength( pAnswer) - 8, bsRequest)
+			
+				If ParseByteString( bsRequest, &S"{N}", lCode) Then
+					If lCode <> 401 Or i <> 1 Then
+						If lCode >= 200 And lCode < 300 Then
+							lckHTTP.Unlock()
+							SetLastError( lCode)
+							Return Value True
+						ElseIf pOwner.bDebug > 2 Then
+							DebugPrintFormat( "<DICENTIS> Http{S} returns code {N03}", bsMethod, lCode)
+						End If
+					End If
+				Else
+					lCode := -1
+				End If
+			End If
+		End If
+	End For
+
+	lckHTTP.Unlock()
+	SetLastError( lCode)
+	Return Value False
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Private Function HttpResponseCutHeader( Optional bsContentType As AddressOf ByteString := Nothing) As Boolean	// True is OK
+
+	Var i As Long
+	Var j As Long
+	Var k As Long
+	Var lDataLength As Long
+	Var bsTemp As ByteString[16]
+
+	lckHTTP.Lock()
+
+	If bsContentType <> Nothing Then
+		j := GetSubByteStringPosition( pAnswer, &S"Content-Type:", 1, False)
+		k := GetSubByteStringPosition( pAnswer, &S"\0D\0A", j)
+		If j = 0 Or k = 0 Or j > i Or j > k Or k > i
+		 Or Not GetByteStringMiddle( pAnswer, j+13, k-j-13, bsContentType)
+		 Or Not TrimByteString( bsContentType, bsContentType)
+		Then
+			SetByteStringActualLength( bsContentType, 0)
+		End If
+	End If
+
+	i := GetSubByteStringPosition( pAnswer, &S"\0D\0A\0D\0A")	// EOF HTTP Header
+	j := GetSubByteStringPosition( pAnswer, &S"Content-Length:", 1, False)
+	If j = 0 Then
+		lDataLength := 0
+		lckHTTP.Unlock()
+		Return Value False
+	Else	
+		k := GetSubByteStringPosition( pAnswer, &S"\0D\0A", j)
+		If i = 0 Or k = 0 Or j > i Or j > k Or k > i
+	 	Or Not GetByteStringMiddle( pAnswer, j+15, k-j-15, bsTemp)
+	 	Or Not ParseByteString( bsTemp, &S"{N}", lDataLength)
+		Then
+			lckHTTP.Unlock()
+			Return Value False
+		End If
+	End If
+
+	lckHTTP.Unlock()
+
+	Return Value GetByteStringRight( pAnswer, GetByteStringActualLength( pAnswer)-i-4+1, pAnswer) And
+		GetByteStringActualLength( pAnswer) = lDataLength
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+End Class
+
+//-------------------------------------------------------------------------------------------
+// Device Driver
+//-------------------------------------------------------------------------------------------
+
+Global DeviceClass Dicentis
+Friend HttpProtocol
+
+Connector CommandChnl
+Connector SpeakersStatus
+Connector WaitingListStatus
+Connector VotingStatus
+
+Var Command As HttpProtocol
+Var lckCommand As _Semaphore
+
+Var Speakers As HttpProtocol
+Var pSpeakerJSON As AddressOf Text
+
+Var WaitingList As HttpProtocol
+Var pWaitingListJSON As AddressOf Text
+
+Var Voting As HttpProtocol
+Var goVoting As Boolean
+
+//-------------------------------------------------------------------------------------------
+// Property
+//-------------------------------------------------------------------------------------------
+
+Protected Property strAddress As Text[128] := "127.0.0.1" WithAttributes
+{
+	PropertyGroup := "Connection",
+	DisplayName := "Address"
+}
+
+Protected Property lPort As Long := 80 WithAttributes
+{
+	PropertyGroup := "Connection",
+	DisplayName := "Port"
+}
+
+Protected Property bsUser As ByteString[32] := &S"" WithAttributes
+{
+	PropertyGroup := "Login",
+	DisplayName := "user"
+}
+
+Protected Property bsPassword As ByteString[32] := &S"" WithAttributes
+{
+	PropertyGroup := "Login",
+	DisplayName := "password"
+}
+
+Protected Property fSSL As Boolean := False WithAttributes
+{
+	PropertyGroup := "Connection",
+	DisplayName := "HTTPS"
+}
+
+Protected Property bDebug As Byte := 0 WithAttributes
+{
+	PropertyGroup := "Debug",
+	DisplayName := "Debug print",
+	EditMode := "Enum; 'None' := 0, 'Discent' := 1, 'Commands' := 2, 'All' := 3"
+
+}
+
+//-------------------------------------------------------------------------------------------
+// Constnt
+//-------------------------------------------------------------------------------------------
+
+//-------------------------------------------------------------------------------------------
+// Variable
+//-------------------------------------------------------------------------------------------
+
+Private Var bsAddress As ByteString[128]
+Private Var bsLoginJSON As ByteString[128]
+
+Private Var lckSid As _Semaphore
+Private Var bsSid As ByteString[256]
+Private Var dLogin As sLogin
+
+Private Var txtTmp As Text[cMaxJsonLength]
+Private Var lckTmp As _Semaphore
+
+Private Var bsCommandBuffer As ByteString[cCommandJsonLength]
+Private Var bsSeatsBuffer As ByteString[cSeatsJsonLength]
+Private Var bsSpeakersBuffer As ByteString[cSpeakersJsonLength]
+Private Var bsWaitingBuffer As ByteString[cWaitingListJsonLength]
+Private Var bsVotingBuffer As ByteString[cVotingJsonLength]
+
+//-------------------------------------------------------------------------------------------
+
+Private Function Init()
+
+	TextToByteString( strAddress, bsAddress, _TEXT_TO_UTF8)
+	FormatByteString( bsLoginJSON, &S"{{\"username\":\"{S}\",\"password\":\"{S}\",\"override\":true}", bsUser, bsPassword)
+
+	Command.Initialize( 1, Me, bsCommandBuffer)
+
+	Speakers.Initialize( 2, Me, bsSeatsBuffer)
+	pSpeakerJSON := Nothing
+
+	WaitingList.Initialize( 3, Me, bsSpeakersBuffer)
+	pWaitingListJSON := Nothing
+
+	Voting.Initialize( 4, Me, bsVotingBuffer)
+	goVoting := False
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+//	Driver function
+//-------------------------------------------------------------------------------------------
+
+Global Function Logoff() As Boolean WithAttributes { HideInIDE := True }
+	Var fResult As Boolean := False
+
+	lckSid.Lock()
+	If Not Command.Cmd( cPOST, &S"/api/logout", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> logoff ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		If bDebug > 0 Then
+			DebugPrint("<DICENTIS> logoff: OK")
+		End If
+		_ClearVariable( dLogin)
+		_ClearVariable( bsSid)
+		fResult := True
+	End If
+	lckSid.Lock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetSystemStatus() As Long	// -1 means some error
+	Var status As sSystemStatus
+
+	status.state := -1
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cGET, &S"/api/system/status", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetSystemStatus ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		lckTmp.Lock()
+		ByteStringToText( Command.pAnswer, txtTmp, _UTF8_TO_TEXT)
+		If Not ParseJSON( txtTmp, status) Then
+			If bDebug > 0 Then
+				DebugPrintFormat( "<DICENTIS> GetSystemStatus-ParseJSON({N}): {S}", GetLastError(), Command.pAnswer)
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetSystemStatus: {N}", status.state)
+		End If
+		lckTmp.Unlock()
+	End If
+	lckCommand.Unlock()
+
+	Return Value status.state
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function PowerOn() As Boolean	// SetSystemStatus=0
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cPUT, &S"/api/system/status", cDataJSON, &S"{\"state\":0}", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> SetSystemStatus(0) ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrint( "<DICENTIS> SetSystemStatus(0)")
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function PowerOff() As Boolean	// SetSystemStatus=2
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cPUT, &S"/api/system/status", cDataJSON, &S"{\"state\":2}", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> SetSystemStatus(2) ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrint( "<DICENTIS> SetSystemStatus(2)")
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function PowerStandby() As Boolean	// SetSystemStatus=1
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cPUT, &S"/api/system/status", cDataJSON, &S"{\"state\":1}", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> SetSystemStatus(1) ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrint( "<DICENTIS> SetSystemStatus(1)")
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetSystemInfoJSON( txtResponse As AddressOf Text) As Boolean WithAttributes { HideInIDE := True }
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cGET, &S"/api/system-info", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetSystemInfo ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		If ByteStringToText( Command.pAnswer, txtResponse, _UTF8_TO_TEXT) Then
+			fResult := True
+		End If
+		If bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetSystemInfo: {S}", Command.pAnswer)
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetSeatsJSON( txtResponse As AddressOf Text) As Boolean
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cGET, &S"/api/seats", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetSeats ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		If ByteStringToText( Command.pAnswer, txtResponse, _UTF8_TO_TEXT) Then
+			fResult := True
+			If bDebug > 0 Then
+				DebugPrint( "<DICENTIS> GetSeats: OK")
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetSeats-ToText ERROR({N})", GetLastError())
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetSpeakersJSON( txtResponse As AddressOf Text) As Boolean
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cGET, &S"/api/speakers", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetSpeakers ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		If ByteStringToText( Command.pAnswer, txtResponse, _UTF8_TO_TEXT) Then
+			fResult := True
+			If bDebug > 0 Then
+				DebugPrint( "<DICENTIS> GetSpeakers: OK")
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetSpeakers-ToText ERROR({N})", GetLastError())
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetSpeakersAvailableJSON( txtResponse As AddressOf Text) As Boolean
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cGET, &S"/api/speakers/available", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetSpeakersAvailable ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		If ByteStringToText( Command.pAnswer, txtResponse, _UTF8_TO_TEXT) Then
+			fResult := True
+			If bDebug > 0 Then
+				DebugPrint( "<DICENTIS> GetSpeakersAvailable: OK")
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetSpeakersAvailable-ToText ERROR({N})", GetLastError())
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetWaitingListJSON( txtResponse As AddressOf Text) As Boolean
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cGET, &S"/api/waiting-list", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetWaitingList ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		If ByteStringToText( Command.pAnswer, txtResponse, _UTF8_TO_TEXT) Then
+			fResult := True
+			If bDebug > 0 Then
+				DebugPrint( "<DICENTIS> GetWaitingList: OK")
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetWaitingList-ToText ERROR({N})", GetLastError())
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetWaitingListAvailableJSON( txtResponse As AddressOf Text) As Boolean
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cGET, &S"/api/waiting-list/available", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetWaitingListAvailable ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		If ByteStringToText( Command.pAnswer, txtResponse, _UTF8_TO_TEXT) Then
+			fResult := True
+			If bDebug > 0 Then
+				DebugPrint( "<DICENTIS> GetWaitingListAvailable: OK")
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetWaitingListAvailable-ToText ERROR({N})", GetLastError())
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetVoting( ByRef status As sVotingParameters) As Boolean
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	_ClearVariable( status)
+	If Not Command.Cmd( cGET, &S"/api/voting", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetVoting ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		lckTmp.Lock()
+		ByteStringToText( Command.pAnswer, txtTmp, _UTF8_TO_TEXT)
+		If Not ParseJSON( txtTmp, status) Then
+			If bDebug > 0 Then
+				DebugPrintFormat( "<DICENTIS> GetVoting-ParseJSON({N}): {S}", GetLastError(), Command.pAnswer)
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetVoting: {S}", Command.pAnswer)
+		End If
+		lckTmp.Unlock()
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function SetVoting( mode As Long, title As ByteString[64], Optional individuals As Boolean := False) As Boolean
+	Var fResult As Boolean := False
+	Var bsJSON As ByteString[128]
+
+	FormatByteString( bsJSON, &S"{{\"mode\":{N},\"subject\":\"{S}\"", mode, title)
+	If individuals Then
+		ConcatenateByteString( bsJSON, bsJSON, &S",\"individuals\":true}")
+	Else
+		ConcatenateByteString( bsJSON, bsJSON, &S",\"individuals\":false}")
+	End If
+
+	lckCommand.Lock()
+
+	If Not Command.Cmd( cPUT, &S"/api/voting", cDataJSON, bsJSON, :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> SetVoting ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> SetVoting: {S}", bsJSON)
+		End If
+	End If
+
+	lckCommand.Unlock()
+
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetVotingState() As Long	// -1 means error
+	Var status As sVotingState
+
+	lckCommand.Lock()
+
+	status.state := -1
+
+	If Not Command.Cmd( cGET, &S"/api/voting/state", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetVotingState ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		lckTmp.Lock()
+		ByteStringToText( Command.pAnswer, txtTmp, _UTF8_TO_TEXT)
+		If Not ParseJSON( txtTmp, status) Then
+			If bDebug > 0 Then
+				DebugPrintFormat( "<DICENTIS> GetVotingState-ParseJSON({N}): {S}", GetLastError(), Command.pAnswer)
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetVotingState: {N}", status.state)
+		End If
+		lckTmp.Unlock()
+	End If
+
+	lckCommand.Unlock()
+
+	Return Value status.state
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function SetVotingState( state As Long) As Boolean
+	Var fResult As Boolean := False
+	Var bsJSON As ByteString[32]
+
+	FormatByteString( bsJSON, &S"{{\"state\":{N}}", state)
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cPUT, &S"/api/voting/state", cDataJSON, bsJSON, :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> SetVotingState ERROR: {S})", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> SetVotingState({N})", state)
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+// 0 = By Asignment
+// 1 = At any Seat
+// 2 = At assigned Seat
+// 3 = OFF
+
+Global Function Set_IdentificationMode_By_Asignment() As Boolean
+	Return Value SetIdentificationMode(0)
+End Function
+
+Global Function Set_IdentificationMode_At_any_Seat() As Boolean
+	Return Value SetIdentificationMode(1)
+End Function
+
+Global Function Set_IdentificationMode_At_assigned_Seat() As Boolean
+	Return Value SetIdentificationMode(2)
+End Function
+
+Global Function Set_IdentificationMode_OFF() As Boolean
+	Return Value SetIdentificationMode(3)
+End Function
+
+Private Function SetIdentificationMode( mode As Long) As Boolean
+	Var fResult As Boolean := False
+	Var bsJSON As ByteString[32]
+
+	FormatByteString( bsJSON, &S"{{\"identification_mode\":{N}}", mode)
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cPUT, &S"/api/participants/settings", cDataJSON, bsJSON, :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> SetIdentificationMode ERROR: {S})", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> SetIdentificationMode({N})", mode)
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetVotingResultJSON( txtResponse As AddressOf Text) As Boolean
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cGET, &S"/api/voting/results", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetVotingResult ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		If ByteStringToText( Command.pAnswer, txtResponse, _UTF8_TO_TEXT) Then
+			fResult := True
+			If bDebug > 0 Then
+				DebugPrint( "<DICENTIS> GetVotingResult: OK")
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetVotingResult-ToText ERROR({N})", GetLastError())
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetSystemJSON( txtResponse As AddressOf Text) As Boolean WithAttributes { HideInIDE := True }
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cGET, &S"/api/system", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetSystem ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		If ByteStringToText( Command.pAnswer, txtResponse, _UTF8_TO_TEXT) Then
+			fResult := True
+			If bDebug > 0 Then
+				DebugPrint( "<DICENTIS> GetSystem: OK")
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetSystem-ToText ERROR({N})", GetLastError())
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetDiscussJSON( txtResponse As AddressOf Text) As Boolean WithAttributes { HideInIDE := True }
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cGET, &S"/api/discuss", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetDiscuss ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		If ByteStringToText( Command.pAnswer, txtResponse, _UTF8_TO_TEXT) Then
+			fResult := True
+			If bDebug > 0 Then
+				DebugPrint( "<DICENTIS> GetDiscuss: OK")
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetDiscuss-ToText ERROR({N})", GetLastError())
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetSystemSettingsJSON( txtResponse As AddressOf Text) As Boolean WithAttributes { HideInIDE := True }
+	Var fResult As Boolean := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cGET, &S"/api/system/settings", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetSystemSettings ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		If ByteStringToText( Command.pAnswer, txtResponse, _UTF8_TO_TEXT) Then
+			fResult := True
+			If bDebug > 0 Then
+				DebugPrint( "<DICENTIS> GetSystemSettings: OK")
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetSystemSettings-ToText ERROR({N})", GetLastError())
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function GetSystemBatteryWarning() As Boolean
+	Var status As sBattery
+
+	status.batteryWarning := False
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cGET, &S"/api/system/battery", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> GetSystemBatteryWarning ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		Command.HttpResponseCutHeader()
+		lckTmp.Lock()
+		ByteStringToText( Command.pAnswer, txtTmp, _UTF8_TO_TEXT)
+		If Not ParseJSON( txtTmp, status) Then
+			If bDebug > 0 Then
+				DebugPrintFormat( "<DICENTIS> GetSystemBatteryWarning-ParseJSON({N}): {S}", GetLastError(), Command.pAnswer)
+			End If
+		ElseIf bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> GetSystemBatteryWarning: warning={L}", status.batteryWarning)
+		End If
+		lckTmp.Unlock()
+	End If
+	lckCommand.Unlock()
+
+	Return Value status.batteryWarning
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function AddToSpeakers( idSeat As Long) As Boolean
+	Var fResult As Boolean := False
+	Var bsData As ByteString[16]
+
+	FormatByteString( bsData, &S"[{N}]", idSeat)
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cPOST, &S"/api/speakers", cDataJSON, bsData, :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> AddToSpeakers ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> AddToSpeakers[{N}]: OK", idSeat)
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function RemoveFromSpeakers( idSeat As Long) As Boolean
+	Var fResult As Boolean := False
+	Var bsURL As ByteString[24]
+
+	FormatByteString( bsURL, &S"/api/speakers/{N}", idSeat)
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cDELETE, bsURL, &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> RemoveFromSpeakers ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> RemoveFromSpeakers[{N}]: OK", idSeat)
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function DeleteSpeakersAndWaitingList( ) As Boolean
+	Var fResult As Boolean := False
+	lckCommand.Lock()
+	If Not Command.Cmd( cDELETE, &S"/api/speakers", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> DeleteSpeakersAndWaitingList ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrint( "<DICENTIS> DeleteSpeakersAndWaitingList: OK")
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function AddToWaitingList( idSeat As Long) As Boolean
+	Var fResult As Boolean := False
+	Var bsData As ByteString[16]
+
+	FormatByteString( bsData, &S"[{N}]", idSeat)
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cPOST, &S"/api/waiting-list", cDataJSON, bsData, :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> AddToWaitingList ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> AddToWaitingList[{N}]: OK", idSeat)
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function RemoveFromWaitingList( idSeat As Long) As Boolean
+	Var fResult As Boolean := False
+	Var bsURL As ByteString[24]
+
+	FormatByteString( bsURL, &S"/api/waiting-list/{N}", idSeat)
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cDELETE, bsURL, &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> RemoveFromWaitingList ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> RemoveFromWaitingList[{N}]: OK", idSeat)
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function DeleteWaitingList( ) As Boolean
+	Var fResult As Boolean := False
+	lckCommand.Lock()
+	If Not Command.Cmd( cDELETE, &S"/api/waiting-list", &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> DeleteWaitingList ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrint( "<DICENTIS> DeleteWaitingList: OK")
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function AddToPriorityCall( idSeat As Long) As Boolean
+	Var fResult As Boolean := False
+	Var bsData As ByteString[16]
+
+	FormatByteString( bsData, &S"[{N}]", idSeat)
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cPOST, &S"/api/priority", cDataJSON, bsData, :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> AddToPriorityCall ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> AddToPriorityCall[{N}]: OK", idSeat)
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function RemoveFromPriorityCall( idSeat As Long) As Boolean
+	Var fResult As Boolean := False
+	Var bsURL As ByteString[24]
+
+	FormatByteString( bsURL, &S"/api/priority/{N}", idSeat)
+
+	lckCommand.Lock()
+	If Not Command.Cmd( cDELETE, bsURL, &S"", &S"", :1.0) Then
+		If bDebug > 0 Then
+			Command.HttpResponseCutHeader()
+			DebugPrintFormat( "<DICENTIS> RemoveFromPriorityCall ERROR: {S}", Command.pAnswer)
+		End If
+	Else
+		fResult := True
+		If bDebug > 0 Then
+			DebugPrintFormat( "<DICENTIS> RemoveFromPriorityCall[{N}]: OK", idSeat)
+		End If
+	End If
+	lckCommand.Unlock()
+
+	Return Value fResult
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function EnableSpeakersPoolingJSON( txtResponse As AddressOf Text) As Boolean
+
+	StopProcess SpeakersPooling
+
+	If txtResponse <> Nothing And StartProcess SpeakersPooling Then
+		pSpeakerJSON := txtResponse
+		Return Value True
+	End If
+
+	Return Value False
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function DisableSpeakersPooling( ) As Boolean
+
+	StopProcess SpeakersPooling
+
+	pSpeakerJSON := Nothing
+
+	Return Value True
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Event OnSpeakersChange As Function()
+
+//-------------------------------------------------------------------------------------------
+
+Private Process SpeakersPooling()
+
+//	DebugPrint( "<DICENTIS> SpeakersPooling")
+
+	Do While pSpeakerJSON <> Nothing
+		If Not Speakers.Cmd( cGET, &S"/api/speakers?isPolling=true", &S"", &S"", 1:0.0) Then
+			If bDebug > 1 Then
+				Speakers.HttpResponseCutHeader()
+				DebugPrintFormat( "<DICENTIS> SpeakersPooling ERROR: {S}", Speakers.pAnswer)
+			End If
+			Wait(:0.5)
+		Else
+			Speakers.HttpResponseCutHeader()
+			If ByteStringToText( Speakers.pAnswer, pSpeakerJSON, _UTF8_TO_TEXT) Then
+				RaiseEvent OnSpeakersChange()
+			ElseIf bDebug > 1 Then
+				DebugPrintFormat( "<DICENTIS> SpeakersPooling-ToText ERROR({N})", GetLastError())
+			End If
+		End If
+	End Do
+
+End Process
+
+//-------------------------------------------------------------------------------------------
+
+Global Function EnableWaitingListPoolingJSON( txtResponse As AddressOf Text) As Boolean
+
+	StopProcess WaitingListPooling
+
+	If txtResponse <> Nothing And StartProcess WaitingListPooling Then
+		pWaitingListJSON := txtResponse
+		Return Value True
+	End If
+
+	Return Value False
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function DisableWaitingListPooling( ) As Boolean
+
+	StopProcess WaitingListPooling
+
+	pWaitingListJSON := Nothing
+
+	Return Value True
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Event OnWaitingListChange As Function()
+
+//-------------------------------------------------------------------------------------------
+
+Private Process WaitingListPooling()
+
+//	DebugPrint( "<DICENTIS> WaitingListPooling")
+
+	Do While pWaitingListJSON <> Nothing
+		If Not WaitingList.Cmd( cGET, &S"/api/waiting-list?isPolling=true", &S"", &S"", 1:0.0) Then
+			If bDebug > 1 Then
+				WaitingList.HttpResponseCutHeader()
+				DebugPrintFormat( "<DICENTIS> WaitingListPooling ERROR: {S}", WaitingList.pAnswer)
+			End If
+			Wait(:0.5)
+		Else
+			WaitingList.HttpResponseCutHeader()
+			If ByteStringToText( WaitingList.pAnswer, pWaitingListJSON, _UTF8_TO_TEXT) Then
+				RaiseEvent OnWaitingListChange()
+			ElseIf bDebug > 1 Then
+				DebugPrintFormat( "<DICENTIS> WaitingListPooling-ToText ERROR({N})", GetLastError())
+			End If
+		End If
+	End Do
+
+End Process
+
+//-------------------------------------------------------------------------------------------
+
+Global Function EnableVotingPooling( ) As Boolean
+
+	StopProcess VotingPooling
+
+	If StartProcess VotingPooling Then
+		goVoting := True
+		Return Value True
+	End If
+
+	Return Value False
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Function DisableVotingPooling( ) As Boolean
+
+	StopProcess VotingPooling
+
+	goVoting := False
+
+	Return Value True
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Global Event OnVotingChange As Process( state As Long)
+
+//-------------------------------------------------------------------------------------------
+
+Private Process VotingPooling()
+	Var status As sVotingState
+	Var fResult As Boolean
+
+//	DebugPrint( "<DICENTIS> VotingPooling")
+	Do While goVoting
+		If Not Voting.Cmd( cGET, &S"/api/voting/state?isPolling=true", &S"", &S"", 1:0.0) Then
+			If bDebug > 1 Then
+				Voting.HttpResponseCutHeader()
+				DebugPrintFormat( "<DICENTIS> VotingPooling ERROR: {S}", Voting.pAnswer)
+			End If
+			Wait(:0.5)
+		Else
+			Voting.HttpResponseCutHeader()
+			lckTmp.Lock()
+			ByteStringToText( Voting.pAnswer, txtTmp, _UTF8_TO_TEXT)
+			fResult := ParseJSON( txtTmp, status)
+			If Not fResult And bDebug > 1 Then
+				DebugPrintFormat( "<DICENTIS> VotingPooling-ParseJSON({N}): {S}", GetLastError(), Voting.pAnswer)
+			End If
+			lckTmp.Unlock()
+			If fResult Then
+				RaiseEvent OnVotingChange( status.state)
+			End If
+		End If
+	End Do
+
+End Process
+
+//-------------------------------------------------------------------------------------------
+// Internal helper functions
+//-------------------------------------------------------------------------------------------
+
+Function Connect( iChnl As Byte, serveraddress As Text, serverport As Long, Optional timeout As Time := :10.0) As Boolean
+
+	Select iChnl
+		Case 1
+			Return Value CommandChnl.Connect( serveraddress, serverport, timeout)
+		Case 2
+			Return Value SpeakersStatus.Connect( serveraddress, serverport, timeout)
+		Case 3
+			Return Value WaitingListStatus.Connect( serveraddress, serverport, timeout)
+		Case 4
+			Return Value VotingStatus.Connect( serveraddress, serverport, timeout)
+	End Select
+
+	Return Value False
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Function ConnectSSL( iChnl As Byte, serveraddress As Text, serverport As Long, Optional timeout As Time := :10.0) As Boolean
+
+	Select iChnl
+		Case 1
+			Return Value CommandChnl.ConnectSSL( serveraddress, serverport, timeout)
+		Case 2
+			Return Value SpeakersStatus.ConnectSSL( serveraddress, serverport, timeout)
+		Case 3
+			Return Value WaitingListStatus.ConnectSSL( serveraddress, serverport, timeout)
+		Case 4
+			Return Value VotingStatus.ConnectSSL( serveraddress, serverport, timeout)
+	End Select
+
+	Return Value False
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Private Function Disconnect( iChnl As Byte)
+
+	Select iChnl
+		Case 1
+			CommandChnl.Disconnect()
+		Case 2
+			SpeakersStatus.Disconnect()
+		Case 3
+			WaitingListStatus.Disconnect()
+		Case 4
+			VotingStatus.Disconnect()
+	End Select
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Function Receive( iChnl As Byte, ByRef receiveddata As ByteString, Optional timeout As Time := :10.0, Optional maxbytestoreceive As Long := 0) As Boolean
+
+	Select iChnl
+		Case 1
+			Return Value CommandChnl.Receive( receiveddata, timeout, maxbytestoreceive)
+		Case 2
+			Return Value SpeakersStatus.Receive( receiveddata, timeout, maxbytestoreceive)
+		Case 3
+			Return Value WaitingListStatus.Receive( receiveddata, timeout, maxbytestoreceive)
+		Case 4
+			Return Value VotingStatus.Receive( receiveddata, timeout, maxbytestoreceive)
+	End Select
+
+	Return Value False
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Function Send( iChnl As Byte, datatosend As ByteString) As Boolean
+
+	Select iChnl
+		Case 1
+			Return Value CommandChnl.Send( datatosend)
+		Case 2
+			Return Value SpeakersStatus.Send( datatosend)
+		Case 3
+			Return Value WaitingListStatus.Send( datatosend)
+		Case 4
+			Return Value VotingStatus.Send( datatosend)
+	End Select
+
+	Return Value False
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+End DeviceClass
+
+//-------------------------------------------------------------------------------------------
+//	Global helper functions
+//-------------------------------------------------------------------------------------------
+
+Private Function EncodeBase64( ByVal bsInput As ByteString, ByRef bsOutput As ByteString) As Boolean
+
+	Var i3 As ByteString[3]
+	Var o4 As ByteString[4]
+	Var i As Long
+	Var nLen As Long
+	Var nQuants As Long
+    
+	nLen := GetByteStringActualLength( bsInput)
+	nQuants := nLen / 3
+	bsOutput := &S""
+
+	If nQuants > 0 Then
+		For i := 0 To nQuants-1
+			GetByteStringMiddle( bsInput, i * 3 + 1, 3, i3)
+		
+			EncTabodeQuantumB( i3, o4)
+
+			ConcatenateByteString( bsOutput, bsOutput, o4)
+		End For
+	End If
+    
+    // Copy with odd bytes
+    // (no real performance hit by using strings here)
+	Select nLen Mod 3
+
+	Case 0
+		o4 := &S""
+
+	Case 1
+		i3[1] := bsInput[nLen]
+		i3[2] := 0
+		i3[3] := 0
+
+		EncTabodeQuantumB( i3, o4)
+
+		o4[3] := &H3D	// "="
+		o4[4] := &H3D	// "="
+
+	Case 2
+		i3[1] := bsInput[nLen - 1]
+		i3[2] := bsInput[nLen]
+		i3[3] := 0
+
+		EncTabodeQuantumB( i3, o4)
+
+		o4[4] := &H3D	// "="
+
+	End Select
+
+	Return Value ConcatenateByteString( bsOutput, bsOutput, o4)
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Private Function EncTabodeQuantumB( ByVal bsInput As ByteString[3], ByRef bsOutput As ByteString[4])
+// Expects at least 4 bytes in b, i.e. Var b(3) As Byte
+    
+    Var b0 As Byte
+    Var b1 As Byte
+    Var b2 As Byte
+    Var b3 As Byte
+     
+    b0 := (bsInput[1] / 4) BitAnd &H3F
+    b1 := ((bsInput[1] * &H10) BitAnd &H30) BitOr ((bsInput[2] / &H10) BitAnd &H0F)
+    b2 := ((bsInput[2] * &H04) BitAnd &H3C) BitOr ((bsInput[3] / &H40) BitAnd &H03)
+    b3 := bsInput[3] BitAnd &H3F
+    
+    SetByteStringActualLength( bsOutput, 4)
+    bsOutput[1] := EncTab( b0)
+    bsOutput[2] := EncTab( b1)
+    bsOutput[3] := EncTab( b2)
+    bsOutput[4] := EncTab( b3)
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Private Function EncTab( i As Byte) As Byte
+
+	If i <= 25 Then
+		Return Value &H41 /*'A'*/ + i
+	Else
+		If i <= 51 Then
+			Return Value &H61 /*'a'*/ + i - 26
+		Else
+			If i <= 61 Then
+				Return Value &H30 /*'0'*/ + i - 52
+			Else
+				If i = 62 Then
+					Return Value &H2B /*'+'*/
+				Else
+					If i = 63 Then
+						Return Value &H2F /*'/'*/
+					End If
+				End If
+			End If
+		End If
+	End If
+
+	Return Value &H3D /*'='*/	// Error
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Private Function Calculate32MD5( ByVal bsInput As ByteString, ByRef bsOutput As ByteString) As Boolean
+
+	Private Var bsTemp As ByteString[16]
+	Private Var bsChar As ByteString[2]
+	Private Var i As Long
+
+	SetByteStringActualLength( bsOutput, 0)
+
+	If Not CalculateMD5( bsInput, bsTemp) Then Return Value False End If
+
+	For i := 1 To GetByteStringActualLength( bsTemp)
+		FormatByteString( bsChar, &S"{Nh02}", bsTemp[i])
+		ConcatenateByteString( bsOutput, bsOutput, bsChar)
+	End For
+
+	Return Value True
+
+End Function
+
+//-------------------------------------------------------------------------------------------
+
+Private Function EncodeDigest( ByRef bsOutput As ByteString, ByVal bsUser As ByteString, ByVal bsPassword As ByteString, ByRef bsAnswer As ByteString) As Boolean
+
+	Var lStart As Long
+	Var lEndURL As Long
+	Var i As Long
+	Var j As Long
+	Var fQop As Boolean
+	Var bsRealm As ByteString[512]
+	Var bsNonce As ByteString[512]
+	Var bsURL As ByteString[512]
+	Var bsOpaque As ByteString[512]
+
+// Parse URL
+	i := GetSubByteStringPosition( bsOutput, &S" ", 1, False)
+	If i <> 0 Then
+		i += 1
+	Else
+		Return Value False
+	End If
+	lEndURL := GetSubByteStringPosition( bsOutput, &S" HTTP/1.0", i, False)
+	If lEndURL = 0 Or i >= lEndURL Or Not GetByteStringMiddle( bsOutput, i, lEndURL-i, bsURL) Then
+		Return Value False
+	End If
+
+// Parse Digest request
+	lStart := GetSubByteStringPosition( bsAnswer, &S"WWW-Authenticate: Digest ", 1, False) + 25
+	i := GetSubByteStringPosition( bsAnswer, &S"Content-Length:", 1, False)
+	If i = 0 Then i := GetSubByteStringPosition( bsAnswer, &S"\0D\0A\0D\0A", 1, False) End If
+	If lStart = 25 Or i = 0 Or lStart > i Then Return Value False End If
+	SetByteStringActualLength( bsAnswer, i)
+
+// Qop
+	fQop := GetSubByteStringPosition( bsAnswer, &S"qop=\"auth\"", lStart, False) <> 0
+		 Or GetSubByteStringPosition( bsAnswer, &S"qop=\"auth,", lStart, False) <> 0
+		 Or GetSubByteStringPosition( bsAnswer, &S",auth\"", lStart, False) <> 0
+
+// realm
+	i := GetSubByteStringPosition( bsAnswer, &S"realm=\"", lStart, False) + 7
+	j := GetSubByteStringPosition( bsAnswer, &S"\"", i, False)
+	If i = 7 Or j = 0 Or i >= j Or Not GetByteStringMiddle( bsAnswer, i, j-i, bsRealm) Then Return Value False End If
+
+// nonce
+	i := GetSubByteStringPosition( bsAnswer, &S"nonce=\"", lStart, False) + 7
+	j := GetSubByteStringPosition( bsAnswer, &S"\"", i, False)
+	If i = 7 Or j = 0 Or i >= j Or Not GetByteStringMiddle( bsAnswer, i, j-i, bsNonce) Then Return Value False End If
+
+// build HTTP record
+	ConcatenateByteString( bsOutput, bsOutput,
+		&S"\0D\0AAuthorization: Digest username=\"", bsUser,
+		&S"\",realm=\"", bsRealm,
+		&S"\",nonce=\"", bsNonce,
+		&S"\",uri=\"", bsURL,
+		&S"\",qop=\"auth\",algorithm=MD5")
+
+	If fQop Then
+		ConcatenateByteString( bsOutput, bsOutput,
+			&S",nc=00000001,cnonce=\"0a4f113b\"")
+	End If
+
+// opaque
+	i := GetSubByteStringPosition( bsAnswer, &S"opaque=\"", lStart, False) + 8
+	j := GetSubByteStringPosition( bsAnswer, &S"\"", i, False)
+	If i > 8 And j <> 0 And i < j And GetByteStringMiddle( bsAnswer, i, j-i, bsOpaque) Then
+		ConcatenateByteString( bsOutput, bsOutput,
+		&S",opaque=\"", bsOpaque, &S"\"")
+	End If
+
+// HA1
+	If Not ConcatenateByteString( bsOpaque, bsUser, &S":", bsRealm, &S":", bsPassword)
+	 Or Not Calculate32MD5( bsOpaque, bsRealm) Then
+		Return Value False
+	End If
+
+// HA2
+	GetByteStringLeft( bsOutput, lEndURL-1, bsOpaque)
+	i := GetSubByteStringPosition( bsOpaque, &S" ")
+	If i = 0 Then Return Value False End If
+	bsOpaque [i] := &H3A	// ':'
+	If Not Calculate32MD5( bsOpaque, bsURL) Then Return Value False End If
+
+// result
+	If fQop Then
+		If Not ConcatenateByteString( bsOpaque, bsRealm, &S":", bsNonce, &S":00000001:0a4f113b:auth:", bsURL)
+	 	Or Not Calculate32MD5( bsOpaque, bsRealm) Then
+			Return Value False
+		End If
+	Else
+		If Not ConcatenateByteString( bsOpaque, bsRealm, &S":", bsNonce, &S":", bsURL)
+	 	Or Not Calculate32MD5( bsOpaque, bsRealm) Then
+			Return Value False
+		End If
+	End If
+
+	ConcatenateByteString( bsOutput, bsOutput,
+		&S",response=\"", bsRealm, &S"\"")
+
+	Return Value True
+
+End Function
+
+//-------------------------------------------------------------------------------------------
