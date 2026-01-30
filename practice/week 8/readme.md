@@ -18,7 +18,7 @@
 Структура файлов
 ```markdown
 practice
-      └── week 9
+      └── week 8
             │
             └── t1.cu (Задача 1)
 ```
